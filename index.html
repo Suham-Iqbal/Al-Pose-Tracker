@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>KAMEHAMEHA</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  #container { position: relative; width: 100vw; height: 100vh; background: #000; display: none; }
+  video#webcam { display: none; }
+  canvas#canvas { position: absolute; width: 100%; height: 100%; z-index: 5; }
+  .splash { position: absolute; z-index: 1000; background: #000; width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; color: white; font-family: sans-serif; }
+  #go { padding: 25px 50px; font-size: 24px; background: #ff9900; border: none; border-radius: 60px; font-weight: bold; color: white; box-shadow: 0 0 30px rgba(255,153,0,0.5); }
+  .controls { position: absolute; bottom: 30px; width: 100%; display: flex; justify-content: space-evenly; z-index: 2000; }
+  .btn { padding: 15px 30px; border-radius: 35px; background: rgba(0,0,0,0.5); color: white; border: 2px solid #ff9900; font-weight: bold; font-family: sans-serif; }
+</style>
+</head>
+<body>
+
+<div class="splash" id="splash">
+  <h1 style="color: orange; font-size: 48px;">KAMEHAMEHA</h1>
+  <button id="go">START</button>
+  <p id="msg" style="color:orange; margin-top:15px; display:none;">Loading...</p>
+</div>
+
+<div id="container">
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div class="controls">
+    <button class="btn" id="flip">🔄 FLIP</button>
+    <button class="btn" id="snap">📸 SNAP</button>
+  </div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+const wc = document.getElementById("webcam");
+const cv = document.getElementById("canvas");
+const c = cv.getContext("2d");
+
+let lm, str, fac = "user", run = false, fr = 0;
+
+// Blob-loaded videos (more reliable on mobile WebView)
+let eVid = null, kVid = null;
+
+async function loadVideoAsBlob(url) {
+  try {
+    const res = await fetch(url);
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const vid = document.createElement("video");
+    vid.src = blobUrl;
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.loop = true;
+    vid.setAttribute("playsinline", "");
+    vid.setAttribute("webkit-playsinline", "");
+    await vid.play();
+    return vid;
+  } catch(e) {
+    console.log("Video load failed:", url, e);
+    return null;
+  }
+}
+
+// Particle system
+const particles = [];
+class Particle {
+  constructor(x, y, type) {
+    this.x = x; this.y = y;
+    this.type = type; // 'ball' or 'beam'
+    this.vx = (Math.random()-0.5) * 4;
+    this.vy = (Math.random()-0.5) * 4;
+    this.life = 1;
+    this.decay = 0.02 + Math.random()*0.03;
+    this.size = 1 + Math.random()*3;
+    this.color = Math.random() > 0.5 ? 
+      `rgba(${150+Math.random()*105},${200+Math.random()*55},255,` : 
+      `rgba(255,255,${200+Math.random()*55},`;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.life -= this.decay;
+  }
+  draw(ctx) {
+    if (this.life <= 0) return;
+    ctx.fillStyle = this.color + this.life + ")";
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * this.life, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+document.getElementById("go").onclick = async () => {
+  document.getElementById("go").style.display = "none";
+  document.getElementById("msg").style.display = "block";
+  document.getElementById("msg").innerText = "Loading Videos...";
+  
+  // Load videos as blobs (within user gesture)
+  [eVid, kVid] = await Promise.all([
+    loadVideoAsBlob("assets/energy.mp4"),
+    loadVideoAsBlob("assets/kamehameha.mp4")
+  ]);
+  
+  document.getElementById("msg").innerText = "Loading AI...";
+  
+  try {
+    const vi = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
+    lm = await PoseLandmarker.createFromOptions(vi, {
+      baseOptions: { 
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", 
+        delegate: "GPU" 
+      },
+      runningMode: "VIDEO", minPoseDetectionConfidence: 0.5
+    });
+    await cam();
+    document.getElementById("splash").style.display = "none";
+    document.getElementById("container").style.display = "block";
+    run = true;
+    tick();
+  } catch(e) { alert(e.message); }
+};
+
+async function cam() {
+  if (str) str.getTracks().forEach(t=>t.stop());
+  str = await navigator.mediaDevices.getUserMedia({ video: { facingMode: fac, width:{ideal:640}, height:{ideal:480} } });
+  wc.srcObject = str;
+  return new Promise(r => wc.onloadedmetadata = r);
+}
+document.getElementById("flip").onclick = async () => { fac = fac==="user"?"environment":"user"; await cam(); };
+
+let lt=-1, sx=-1, sy=-1, pst="IDLE", ic=0;
+
+function tick() {
+  if (!run) return;
+  if (wc.currentTime !== lt && wc.videoWidth > 0) {
+    lt = wc.currentTime;
+    cv.width = wc.videoWidth; cv.height = wc.videoHeight;
+    paint(lm.detectForVideo(wc, performance.now()));
+    fr++;
+  }
+  requestAnimationFrame(tick);
+}
+
+function paint(r) {
+  const W = cv.width, H = cv.height;
+  const front = fac === "user";
+
+  c.save();
+  if (front) { c.translate(W,0); c.scale(-1,1); }
+  c.drawImage(wc, 0, 0, W, H);
+  c.restore();
+
+  // Slight darken
+  c.fillStyle = "rgba(0,0,0,0.25)";
+  c.fillRect(0,0,W,H);
+
+  let st = "IDLE", hx = -1, hy = -1;
+
+  if (r.landmarks && r.landmarks[0]) {
+    const L = r.landmarks[0];
+    const X = i => front ? (1-L[i].x)*W : L[i].x*W;
+    const Y = i => L[i].y*H;
+
+    const lx=X(15), ly=Y(15), rx=X(16), ry=Y(16);
+    const dn = Math.hypot(L[15].x-L[16].x, L[15].y-L[16].y);
+
+    if (dn < 0.45) {
+      hx = (lx+rx)/2;
+      hy = (ly+ry)/2;
+      const shx=(X(11)+X(12))/2, shy=(Y(11)+Y(12))/2;
+      const armLen = Math.hypot(hx-shx, hy-shy);
+      st = armLen > H*0.25 ? "FIRING" : "CHARGING";
+    }
+  }
+
+  if (st==="IDLE" && pst!=="IDLE") { ic++; if(ic<5) st=pst; } else ic=0;
+  if (hx!==-1) {
+    if (sx===-1) { sx=hx; sy=hy; }
+    else { sx=0.5*sx+0.5*hx; sy=0.5*sy+0.5*hy; }
+  } else if (st==="IDLE") { sx=-1; sy=-1; }
+  
+  if (st==="CHARGING" && pst!=="CHARGING" && eVid) eVid.currentTime=0;
+  if (st==="FIRING" && pst!=="FIRING" && kVid) kVid.currentTime=0;
+  pst = st;
+
+  // === EFFECTS ===
+  if (st !== "IDLE" && sx !== -1) {
+    c.save();
+    c.globalCompositeOperation = "lighter";
+
+    if (st === "CHARGING") {
+      const size = H * 0.35;
+      
+      // VIDEO overlay (if loaded)
+      if (eVid && eVid.readyState >= 2) {
+        if (eVid.paused) eVid.play().catch(()=>{});
+        c.drawImage(eVid, sx-size/2, sy-size/2, size, size);
+      }
+      
+      // Glow enhancement
+      const pulse = 1 + 0.12*Math.sin(fr*0.12);
+      const R = size*0.3*pulse;
+      const g = c.createRadialGradient(sx,sy,0, sx,sy, R*1.5);
+      g.addColorStop(0, "rgba(255,255,255,0.6)");
+      g.addColorStop(0.4, "rgba(100,200,255,0.4)");
+      g.addColorStop(1, "transparent");
+      c.fillStyle = g;
+      c.beginPath(); c.arc(sx,sy,R*1.5,0,Math.PI*2); c.fill();
+
+      // Spawn particles
+      for (let i=0;i<3;i++) {
+        particles.push(new Particle(
+          sx + (Math.random()-0.5)*R*2,
+          sy + (Math.random()-0.5)*R*2, 'ball'
+        ));
+      }
+    }
+    else if (st === "FIRING") {
+      const beamH = H * 0.75;
+      const beamW = beamH * (16/9);
+      
+      // VIDEO overlay (if loaded)
+      if (kVid && kVid.readyState >= 2) {
+        if (kVid.paused) kVid.play().catch(()=>{});
+        c.drawImage(kVid, sx, sy-beamH/2, beamW, beamH);
+      }
+      
+      // Procedural beam enhancement
+      const bw = H*0.1;
+      const pulse = 1+0.08*Math.sin(fr*0.2);
+      const hw = bw*pulse;
+      
+      // Outer glow beam
+      const g1 = c.createLinearGradient(sx, sy, sx+W, sy);
+      g1.addColorStop(0, "rgba(0,150,255,0.4)");
+      g1.addColorStop(0.5, "rgba(0,80,255,0.2)");
+      g1.addColorStop(1, "transparent");
+      c.fillStyle = g1;
+      c.beginPath();
+      c.moveTo(sx, sy-hw*1.8);
+      c.quadraticCurveTo(sx+W*0.5, sy-hw*0.5, sx+W, sy);
+      c.quadraticCurveTo(sx+W*0.5, sy+hw*0.5, sx, sy+hw*1.8);
+      c.closePath(); c.fill();
+      
+      // Core beam
+      const g2 = c.createLinearGradient(sx, sy, sx+W*0.7, sy);
+      g2.addColorStop(0, "rgba(200,230,255,0.7)");
+      g2.addColorStop(0.5, "rgba(100,180,255,0.4)");
+      g2.addColorStop(1, "transparent");
+      c.fillStyle = g2;
+      c.beginPath();
+      c.moveTo(sx, sy-hw*0.8);
+      c.quadraticCurveTo(sx+W*0.35, sy, sx+W*0.7, sy);
+      c.quadraticCurveTo(sx+W*0.35, sy, sx, sy+hw*0.8);
+      c.closePath(); c.fill();
+
+      // Source ball
+      const br = H*0.1;
+      const bg = c.createRadialGradient(sx,sy,0,sx,sy,br);
+      bg.addColorStop(0,"white");
+      bg.addColorStop(0.3,"rgba(150,220,255,0.9)");
+      bg.addColorStop(0.7,"rgba(0,100,255,0.4)");
+      bg.addColorStop(1,"transparent");
+      c.fillStyle=bg;
+      c.beginPath(); c.arc(sx,sy,br,0,Math.PI*2); c.fill();
+
+      // Beam particles
+      for (let i=0;i<5;i++) {
+        const px = sx + Math.random()*W*0.6;
+        const py = sy + (Math.random()-0.5)*hw*2;
+        particles.push(new Particle(px, py, 'beam'));
+      }
+    }
+
+    // Update & draw particles
+    for (let i=particles.length-1; i>=0; i--) {
+      particles[i].update();
+      particles[i].draw(c);
+      if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+    // Cap particles
+    while (particles.length > 200) particles.shift();
+
+    c.restore();
+  } else {
+    if (eVid) eVid.pause();
+    if (kVid) kVid.pause();
+    particles.length = 0;
+  }
+}
+
+document.getElementById("snap").onclick = () => {
+  const d = cv.toDataURL("image/png");
+  if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({type:'image', base64: d}));
+};
+</script>
+</body>
+</html>
